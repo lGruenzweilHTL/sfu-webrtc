@@ -1,0 +1,29 @@
+# WebRTC SFU Project — Python Dependencies
+# Install: pip install -r requirements.txt
+#
+# System packages needed:
+#   ffmpeg (for camera/mic capture)
+#     Linux:   sudo apt install ffmpeg v4l-utils libportaudio2
+#     macOS:   brew install ffmpeg portaudio
+#     Windows: https://ffmpeg.org/download.html
+#
+#   For audio playback (sounddevice needs PortAudio):
+#     Linux:   sudo apt install libportaudio2
+#     macOS:   brew install portaudio
+#     Windows: included with sounddevice wheel
+
+# Core WebRTC stack
+aiortc>=1.9.0
+
+# Async HTTP (signaling)
+aiohttp>=3.9.0
+aiohttp-cors>=0.7.0
+
+# Live video display
+opencv-python>=4.8.0
+
+# Live audio playback (requires PortAudio system lib)
+sounddevice>=0.4.6
+
+# Numeric array ops (used by audio/video sinks)
+numpy>=1.24.0
