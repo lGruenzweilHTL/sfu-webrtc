@@ -1,0 +1,135 @@
+﻿import asyncio
+import logging
+import uuid
+from typing import Dict, List, Optional
+from aiortc import RTCPeerConnection, RTCSessionDescription, MediaStreamTrack
+from aiortc.contrib.media import MediaRelay
+
+logger = logging.getLogger("sfu-server")
+
+class SFUManager:
+    def __init__(self):
+        self.relay = MediaRelay()
+        self.peer_connections: Dict[str, RTCPeerConnection] = {}
+        # List of {"audio": track, "video": track, "publisher_id": str}
+        self.published_tracks: List[Dict] = []
+        self.ice_candidates: Dict[str, List[dict]] = {}
+
+    def create_session_id(self) -> str:
+        return str(uuid.uuid4())
+
+    def get_published_relay_tracks(self, exclude_publisher: Optional[str] = None):
+        result = []
+        for pub in self.published_tracks:
+            if exclude_publisher and pub["publisher_id"] == exclude_publisher:
+                continue
+            entry = {"publisher_id": pub["publisher_id"]}
+            if pub.get("audio"):
+                entry["audio"] = self.relay.subscribe(pub["audio"])
+            if pub.get("video"):
+                entry["video"] = self.relay.subscribe(pub["video"])
+            result.append(entry)
+        return result
+
+    async def add_publisher(self, sdp: str, sdp_type: str):
+        session_id = self.create_session_id()
+        pc = RTCPeerConnection()
+        self.peer_connections[session_id] = pc
+        self.ice_candidates[session_id] = []
+
+        pub_entry = {"publisher_id": session_id, "audio": None, "video": None}
+        self.published_tracks.append(pub_entry)
+
+        @pc.on("track")
+        async def on_track(track: MediaStreamTrack):
+            logger.info(f"[{session_id}] Publisher sent {track.kind} track")
+            if track.kind == "audio":
+                pub_entry["audio"] = track
+            elif track.kind == "video":
+                pub_entry["video"] = track
+
+        @pc.on("icecandidate")
+        async def on_ice(candidate):
+            if candidate:
+                self.ice_candidates[session_id].append({
+                    "candidate": candidate.candidate,
+                    "sdpMid": candidate.sdpMid,
+                    "sdpMLineIndex": candidate.sdpMLineIndex,
+                })
+
+        @pc.on("connectionstatechange")
+        async def on_state():
+            logger.info(f"[{session_id}] Publisher state: {pc.connectionState}")
+            if pc.connectionState in ("failed", "closed"):
+                await self.cleanup(session_id)
+
+        offer = RTCSessionDescription(sdp=sdp, type=sdp_type)
+        await pc.setRemoteDescription(offer)
+        answer = await pc.createAnswer()
+        await pc.setLocalDescription(answer)
+
+        return {
+            "session_id": session_id,
+            "sdp": pc.localDescription.sdp,
+            "type": pc.localDescription.type,
+        }
+
+    async def add_subscriber(self, exclude_publisher: Optional[str] = None):
+        session_id = self.create_session_id()
+        pc = RTCPeerConnection()
+        self.peer_connections[session_id] = pc
+        self.ice_candidates[session_id] = []
+
+        relay_tracks = self.get_published_relay_tracks(exclude_publisher=exclude_publisher)
+        for entry in relay_tracks:
+            if "audio" in entry:
+                pc.addTrack(entry["audio"])
+            if "video" in entry:
+                pc.addTrack(entry["video"])
+
+        @pc.on("icecandidate")
+        async def on_ice(candidate):
+            if candidate:
+                self.ice_candidates[session_id].append({
+                    "candidate": candidate.candidate,
+                    "sdpMid": candidate.sdpMid,
+                    "sdpMLineIndex": candidate.sdpMLineIndex,
+                })
+
+        @pc.on("connectionstatechange")
+        async def on_state():
+            logger.info(f"[{session_id}] Subscriber state: {pc.connectionState}")
+            if pc.connectionState in ("failed", "closed"):
+                await self.cleanup(session_id)
+
+        offer = await pc.createOffer()
+        await pc.setLocalDescription(offer)
+
+        return {
+            "session_id": session_id,
+            "sdp": pc.localDescription.sdp,
+            "type": pc.localDescription.type,
+        }
+
+    async def set_answer(self, session_id: str, sdp: str, sdp_type: str):
+        pc = self.peer_connections.get(session_id)
+        if not pc:
+            return False
+        answer = RTCSessionDescription(sdp=sdp, type=sdp_type)
+        await pc.setRemoteDescription(answer)
+        return True
+
+    async def cleanup(self, session_id: str):
+        pc = self.peer_connections.pop(session_id, None)
+        if pc:
+            await pc.close()
+        self.published_tracks = [p for p in self.published_tracks if p["publisher_id"] != session_id]
+        self.ice_candidates.pop(session_id, None)
+        logger.info(f"[{session_id}] Cleaned up session")
+
+    async def close_all(self):
+        coros = [pc.close() for pc in self.peer_connections.values()]
+        await asyncio.gather(*coros)
+        self.peer_connections.clear()
+        self.published_tracks.clear()
+        self.ice_candidates.clear()
