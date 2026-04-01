@@ -1,15 +1,9 @@
-"""
-WebRTC Python Client — with live video display and audio playback
-=================================================================
-This client publishes your camera/mic to the SFU server and shows
-all remote participants in a real-time OpenCV window.
-"""
-
 import argparse
 import asyncio
 import logging
 import signal
 import threading
+import multiprocessing
 import aiohttp
 
 from signaling import SFUClient
@@ -21,7 +15,7 @@ from webrtc import do_publish, do_subscribe
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("webrtc-client")
 
-async def run_async(args, frame_store, local_frame_store, mute_state, stop_event):
+async def run_async(args, video_queue, mute_state, stop_event):
     url = f"http://{args.host}:{args.port}"
     logger.info(f"SFU: {url}")
 
@@ -45,23 +39,21 @@ async def run_async(args, frame_store, local_frame_store, mute_state, stop_event
             pub_pc, pub_sid = await do_publish(sfu, media, args.no_video, args.no_audio)
 
             if media.video and not args.no_video and not args.no_gui:
-                preview = LocalPreviewSink(media.video, local_frame_store)
+                preview = LocalPreviewSink(media.video, video_queue)
                 await preview.start()
 
         if args.mode in ("subscribe", "both"):
-            # do_subscribe now returns the websocket as well
             sub_pc, sub_sid, vsinks, asinks, sub_ws = await do_subscribe(
-                sfu, frame_store, exclude=pub_sid)
+                sfu, video_queue, exclude=pub_sid)
             all_sinks = vsinks + asinks
 
         logger.info("Live — Q in window or Ctrl+C to quit")
 
-        loop = asyncio.get_event_loop()
         try:
+            loop = asyncio.get_event_loop()
             loop.add_signal_handler(signal.SIGINT, stop_event.set)
             loop.add_signal_handler(signal.SIGTERM, stop_event.set)
         except (NotImplementedError, ValueError):
-            # signal handlers not supported on Windows loop or if not in main thread
             pass
 
         while not stop_event.is_set():
@@ -79,7 +71,6 @@ async def run_async(args, frame_store, local_frame_store, mute_state, stop_event
         for pc in (pub_pc, sub_pc):
             if pc:
                 await pc.close()
-        logger.info("Done.")
 
 def main():
     parser = argparse.ArgumentParser(description="WebRTC SFU client")
@@ -97,28 +88,45 @@ def main():
     if args.no_gui or not CV2_AVAILABLE:
         args.no_gui = True
 
-    frame_store = {}
-    local_frame_store = {}
-    mute_state = {"mic": False, "cam": False}
-    stop_event = threading.Event()
+    # Multi-process communication primitives
+    video_queue = multiprocessing.Queue(maxsize=30)
+    stop_event = multiprocessing.Event()
+    
+    # Manager for sharing simple state across processes
+    manager = multiprocessing.Manager()
+    mute_state = manager.dict({"mic": False, "cam": False})
 
-    def _bg():
-        asyncio.run(run_async(args, frame_store, local_frame_store, mute_state, stop_event))
+    # Start WebRTC thread in the main process
+    def _webrtc_thread():
+        asyncio.run(run_async(args, video_queue, mute_state, stop_event))
 
-    t = threading.Thread(target=_bg, daemon=True)
-    t.start()
+    webrtc_t = threading.Thread(target=_webrtc_thread, daemon=True)
+    webrtc_t.start()
 
     if args.no_gui:
         try:
-            while t.is_alive():
-                t.join(1)
+            while webrtc_t.is_alive():
+                webrtc_t.join(1)
         except KeyboardInterrupt:
             stop_event.set()
     else:
-        render_loop(frame_store, local_frame_store, stop_event, mute_state)
-    
+        # Launch OpenCV in its own OS process to bypass the GIL
+        gui_p = multiprocessing.Process(
+            target=render_loop,
+            args=(video_queue, stop_event, mute_state)
+        )
+        gui_p.start()
+        
+        try:
+            gui_p.join()
+        except KeyboardInterrupt:
+            stop_event.set()
+        
+        if gui_p.is_alive():
+            gui_p.terminate()
+
     stop_event.set()
-    t.join(timeout=5)
+    webrtc_t.join(timeout=5)
 
 if __name__ == "__main__":
     main()

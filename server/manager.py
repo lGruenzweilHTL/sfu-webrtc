@@ -1,7 +1,7 @@
 ﻿import asyncio
 import logging
 import uuid
-from typing import Dict, List, Optional, Callable, Any
+from typing import Dict, List, Optional, Callable, Any, Set
 from aiortc import RTCPeerConnection, RTCSessionDescription, MediaStreamTrack
 from aiortc.contrib.media import MediaRelay
 
@@ -18,16 +18,17 @@ class SFUManager:
     def create_session_id(self) -> str:
         return str(uuid.uuid4())
 
-    def get_published_relay_tracks(self, exclude_publisher: Optional[str] = None):
+    def get_published_source_tracks(self, exclude_publisher: Optional[str] = None):
+        """Returns the original source tracks from publishers."""
         result = []
         for pub in self.published_tracks:
             if exclude_publisher and pub["publisher_id"] == exclude_publisher:
                 continue
             entry = {"publisher_id": pub["publisher_id"]}
             if pub.get("audio"):
-                entry["audio"] = self.relay.subscribe(pub["audio"])
+                entry["audio"] = pub["audio"]
             if pub.get("video"):
-                entry["video"] = self.relay.subscribe(pub["video"])
+                entry["video"] = pub["video"]
             result.append(entry)
         return result
 
@@ -42,12 +43,14 @@ class SFUManager:
 
         @pc.on("track")
         async def on_track(track: MediaStreamTrack):
-            logger.info(f"[{session_id}] Publisher sent {track.kind} track")
+            logger.info(f"[{session_id}] Publisher sent {track.kind} track: {track.id}")
             if track.kind == "audio":
                 pub_entry["audio"] = track
             elif track.kind == "video":
                 pub_entry["video"] = track
-            await self._notify_subscribers()
+            
+            # Debounce/Notify after a small delay to catch multiple tracks (audio+video)
+            asyncio.create_task(self._notify_subscribers_debounced())
 
         @pc.on("icecandidate")
         async def on_ice(candidate):
@@ -60,12 +63,10 @@ class SFUManager:
 
         @pc.on("connectionstatechange")
         async def on_state():
-            logger.info(f"[{session_id}] Publisher state: {pc.connectionState}")
             if pc.connectionState in ("failed", "closed"):
                 await self.cleanup(session_id)
 
-        offer = RTCSessionDescription(sdp=sdp, type=sdp_type)
-        await pc.setRemoteDescription(offer)
+        await pc.setRemoteDescription(RTCSessionDescription(sdp=sdp, type=sdp_type))
         answer = await pc.createAnswer()
         await pc.setLocalDescription(answer)
 
@@ -83,7 +84,9 @@ class SFUManager:
         self.subscribers[session_id] = {
             "callback": notify_callback,
             "exclude": exclude_publisher,
-            "pc": pc
+            "pc": pc,
+            "negotiating": False,
+            "added_track_ids": set() # Track IDs already added to this PC
         }
 
         await self._update_subscriber_tracks(session_id)
@@ -99,7 +102,6 @@ class SFUManager:
 
         @pc.on("connectionstatechange")
         async def on_state():
-            logger.info(f"[{session_id}] Subscriber state: {pc.connectionState}")
             if pc.connectionState in ("failed", "closed"):
                 await self.cleanup(session_id)
 
@@ -114,43 +116,65 @@ class SFUManager:
 
     async def _update_subscriber_tracks(self, session_id: str):
         sub = self.subscribers.get(session_id)
-        if not sub:
-            return False
+        if not sub: return False
         
         pc = sub["pc"]
         exclude = sub["exclude"]
-        relay_tracks = self.get_published_relay_tracks(exclude_publisher=exclude)
-        current_tracks = {sender.track for sender in pc.getSenders() if sender.track}
+        added_ids = sub["added_track_ids"]
+        
+        sources = self.get_published_source_tracks(exclude_publisher=exclude)
         
         added = False
-        for entry in relay_tracks:
-            if "audio" in entry and entry["audio"] not in current_tracks:
-                pc.addTrack(entry["audio"])
-                added = True
-            if "video" in entry and entry["video"] not in current_tracks:
-                pc.addTrack(entry["video"])
-                added = True
+        for entry in sources:
+            for kind in ["audio", "video"]:
+                track = entry.get(kind)
+                if track and track.id not in added_ids:
+                    # Create a proxy ONLY when adding to a new subscriber
+                    proxy = self.relay.subscribe(track)
+                    pc.addTrack(proxy)
+                    added_ids.add(track.id)
+                    added = True
         return added
+
+    async def _notify_subscribers_debounced(self):
+        # Wait a bit to group audio/video track updates
+        await asyncio.sleep(0.5)
+        await self._notify_subscribers()
 
     async def _notify_subscribers(self):
         for session_id, sub in list(self.subscribers.items()):
+            if sub["negotiating"] or sub["pc"].signalingState != "stable":
+                continue
+                
             if await self._update_subscriber_tracks(session_id):
-                pc = sub["pc"]
-                offer = await pc.createOffer()
-                await pc.setLocalDescription(offer)
-                await sub["callback"]({
-                    "type": "offer",
-                    "sdp": pc.localDescription.sdp,
-                    "session_id": session_id
-                })
+                try:
+                    sub["negotiating"] = True
+                    pc = sub["pc"]
+                    offer = await pc.createOffer()
+                    await pc.setLocalDescription(offer)
+                    await sub["callback"]({
+                        "type": "offer",
+                        "sdp": pc.localDescription.sdp,
+                        "session_id": session_id
+                    })
+                except Exception:
+                    sub["negotiating"] = False
 
     async def set_answer(self, session_id: str, sdp: str, sdp_type: str):
         pc = self.peer_connections.get(session_id)
-        if not pc:
+        if not pc: return False
+        
+        try:
+            await pc.setRemoteDescription(RTCSessionDescription(sdp=sdp, type=sdp_type))
+            if session_id in self.subscribers:
+                self.subscribers[session_id]["negotiating"] = False
+                # Re-check for any tracks added during negotiation
+                asyncio.create_task(self._notify_subscribers())
+            return True
+        except Exception:
+            if session_id in self.subscribers:
+                self.subscribers[session_id]["negotiating"] = False
             return False
-        answer = RTCSessionDescription(sdp=sdp, type=sdp_type)
-        await pc.setRemoteDescription(answer)
-        return True
 
     async def cleanup(self, session_id: str):
         pc = self.peer_connections.pop(session_id, None)
