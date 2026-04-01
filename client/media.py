@@ -1,6 +1,46 @@
 ﻿import logging
 import platform
 from aiortc.contrib.media import MediaPlayer
+from aiortc import MediaStreamTrack
+import asyncio
+
+class LatencyControlTrack(MediaStreamTrack):
+    """
+    Consumes frames from the source track as fast as possible to prevent aiortc's
+    internal Queues from blowing up memory. Drops the oldest frames if network/UI is slow.
+    """
+    def __init__(self, track: MediaStreamTrack):
+        super().__init__()
+        self.kind = track.kind
+        self._track = track
+        max_size = 50 if self.kind == "audio" else 2
+        self._queue = asyncio.Queue(maxsize=max_size)
+        self._task = asyncio.ensure_future(self._run())
+
+    async def _run(self):
+        while True:
+            try:
+                frame = await self._track.recv()
+                if self._queue.full():
+                    try:
+                        self._queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        pass
+                self._queue.put_nowait(frame)
+            except Exception:
+                break
+
+    async def recv(self):
+        if self.readyState != "live":
+            raise Exception("Track is closed")
+        return await self._queue.get()
+
+    def stop(self):
+        super().stop()
+        if self._task:
+            self._task.cancel()
+        if hasattr(self._track, "stop"):
+            self._track.stop()
 
 logger = logging.getLogger("webrtc-client")
 

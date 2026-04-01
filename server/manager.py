@@ -7,6 +7,47 @@ from aiortc.contrib.media import MediaRelay
 
 logger = logging.getLogger("sfu-server")
 
+class LatencyControlTrack(MediaStreamTrack):
+    """
+    Consumes frames from the source track as fast as possible to prevent aiortc's
+    internal JitterBuffers/Queues from blowing up memory. If the sink (network or UI)
+    is too slow, it drops the oldest frames to maintain real-time latency.
+    """
+    def __init__(self, track: MediaStreamTrack):
+        super().__init__()
+        self.kind = track.kind
+        self._track = track
+        # Audio frames are tiny and frequent (typically 20ms). 50 frames = 1 second buffer.
+        # Video frames are huge. 2 frames is plenty.
+        max_size = 50 if self.kind == "audio" else 2
+        self._queue = asyncio.Queue(maxsize=max_size)
+        self._task = asyncio.ensure_future(self._run())
+
+    async def _run(self):
+        while True:
+            try:
+                frame = await self._track.recv()
+                if self._queue.full():
+                    try:
+                        self._queue.get_nowait()  # Drop the oldest frame
+                    except asyncio.QueueEmpty:
+                        pass
+                self._queue.put_nowait(frame)
+            except Exception:
+                break
+
+    async def recv(self):
+        if self.readyState != "live":
+            raise Exception("Track is closed")
+        return await self._queue.get()
+
+    def stop(self):
+        super().stop()
+        if self._task:
+            self._task.cancel()
+        if hasattr(self._track, "stop"):
+            self._track.stop()
+
 class SFUManager:
     def __init__(self):
         self.relay = MediaRelay()
@@ -14,6 +55,8 @@ class SFUManager:
         self.published_tracks: List[Dict] = []
         self.ice_candidates: Dict[str, List[dict]] = {}
         self.subscribers: Dict[str, Dict[str, Any]] = {}
+        # Keep references to the background tasks that drain the server's JitterBuffers
+        self._drain_tasks: Set[asyncio.Task] = set()
 
     def create_session_id(self) -> str:
         return str(uuid.uuid4())
@@ -48,6 +91,21 @@ class SFUManager:
                 pub_entry["audio"] = track
             elif track.kind == "video":
                 pub_entry["video"] = track
+                
+            # Crucial Fix: Create a silent proxy track that instantly drains 
+            # the JitterBuffer even if no subscribers are in the room.
+            dummy_proxy = self.relay.subscribe(track)
+            
+            async def _drain(t):
+                try:
+                    while True:
+                        await t.recv()
+                except Exception:
+                    pass
+                    
+            task = asyncio.create_task(_drain(dummy_proxy))
+            self._drain_tasks.add(task)
+            task.add_done_callback(self._drain_tasks.discard)
             
             # Debounce/Notify after a small delay to catch multiple tracks (audio+video)
             asyncio.create_task(self._notify_subscribers_debounced())
@@ -158,7 +216,9 @@ class SFUManager:
                 if track and track.id not in added_ids:
                     # Create a proxy ONLY when adding to a new subscriber
                     proxy = self.relay.subscribe(track)
-                    pc.addTrack(proxy)
+                    # Wrap it to prevent slow subscribers from bloat-leaking the server RAM
+                    latency_controlled_proxy = LatencyControlTrack(proxy)
+                    pc.addTrack(latency_controlled_proxy)
                     added_ids.add(track.id)
                     added = True
         return added
@@ -219,3 +279,6 @@ class SFUManager:
         self.published_tracks.clear()
         self.ice_candidates.clear()
         self.subscribers.clear()
+        for task in self._drain_tasks:
+            task.cancel()
+        self._drain_tasks.clear()

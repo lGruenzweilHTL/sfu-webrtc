@@ -8,7 +8,7 @@ import aiohttp
 
 from aiortc.contrib.media import MediaRelay
 from signaling import SFUClient
-from media import open_camera_and_mic
+from media import open_camera_and_mic, LatencyControlTrack
 from sinks import LocalPreviewSink
 from gui import render_loop, CV2_AVAILABLE
 from webrtc import do_publish, do_subscribe
@@ -57,13 +57,13 @@ async def run_async(args, video_queue, mute_state, stop_event):
                 if args.no_video:
                     asyncio.ensure_future(discard_track(media.video))
                 else:
-                    video_track = relay.subscribe(media.video)
+                    video_track = LatencyControlTrack(relay.subscribe(media.video))
                     
             if media.audio:
                 if args.no_audio:
                     asyncio.ensure_future(discard_track(media.audio))
                 else:
-                    audio_track = relay.subscribe(media.audio)
+                    audio_track = LatencyControlTrack(relay.subscribe(media.audio))
 
             # Create a mock media object to pass to do_publish
             class _MockMedia:
@@ -74,7 +74,7 @@ async def run_async(args, video_queue, mute_state, stop_event):
             pub_pc, pub_sid = await do_publish(sfu, _MockMedia(video_track, audio_track), args.no_video, args.no_audio)
 
             if video_track and media.video and not args.no_gui:
-                preview_track = relay.subscribe(media.video)
+                preview_track = LatencyControlTrack(relay.subscribe(media.video))
                 preview = LocalPreviewSink(preview_track, video_queue)
                 await preview.start()
 
