@@ -1,6 +1,9 @@
-﻿import logging
+﻿import asyncio
+import json
+import logging
 from aiortc import RTCPeerConnection, RTCSessionDescription
 from sinks import VideoSink, AudioSink
+from aiohttp import WSMsgType
 
 logger = logging.getLogger("webrtc-client")
 
@@ -23,10 +26,11 @@ async def do_publish(sfu, media, no_video=False, no_audio=False):
     return pc, resp["session_id"]
 
 async def do_subscribe(sfu, frame_store, exclude=None):
-    resp = await sfu.subscribe(exclude=exclude)
-    sid = resp["session_id"]
+    ws = await sfu.connect_websocket()
+    await ws.send_json({"type": "subscribe", "exclude_publisher": exclude})
+    
     pc = RTCPeerConnection()
-
+    sid = None
     video_sinks, audio_sinks = [], []
     counters = {"v": 0, "a": 0}
 
@@ -51,9 +55,52 @@ async def do_subscribe(sfu, frame_store, exclude=None):
     async def _():
         logger.info(f"[subscribe] {pc.connectionState}")
 
-    await pc.setRemoteDescription(RTCSessionDescription(sdp=resp["sdp"], type=resp["type"]))
-    answer = await pc.createAnswer()
-    await pc.setLocalDescription(answer)
-    await sfu.send_answer(sid, pc.localDescription.sdp, pc.localDescription.type)
-    logger.info(f"Subscribed — session {sid}")
-    return pc, sid, video_sinks, audio_sinks
+    @pc.on("icecandidate")
+    async def on_ice(candidate):
+        if candidate and sid:
+            await ws.send_json({
+                "type": "ice_candidate",
+                "session_id": sid,
+                "candidate": {
+                    "candidate": candidate.candidate,
+                    "sdpMid": candidate.sdpMid,
+                    "sdpMLineIndex": candidate.sdpMLineIndex,
+                }
+            })
+
+    async def handle_messages():
+        nonlocal sid
+        async for msg in ws:
+            if msg.type == WSMsgType.TEXT:
+                data = json.loads(msg.data)
+                msg_type = data.get("type")
+                
+                if msg_type == "offer":
+                    is_renegotiation = sid is not None
+                    if not sid:
+                        sid = data.get("session_id")
+                        logger.info(f"Subscribed — session {sid}")
+
+                    offer = RTCSessionDescription(sdp=data["sdp"], type=data["type"])
+                    await pc.setRemoteDescription(offer)
+                    
+                    answer = await pc.createAnswer()
+                    await pc.setLocalDescription(answer)
+                    
+                    await ws.send_json({
+                        "type": "answer_renegotiation" if is_renegotiation else "answer",
+                        "session_id": sid,
+                        "sdp": pc.localDescription.sdp,
+                        "type": pc.localDescription.type
+                    })
+                else:
+                    logger.warning(f"Unknown message type from server: {msg_type}")
+            elif msg.type in (WSMsgType.CLOSE, WSMsgType.ERROR):
+                break
+
+    asyncio.ensure_future(handle_messages())
+
+    while not sid:
+        await asyncio.sleep(0.1)
+
+    return pc, sid, video_sinks, audio_sinks, ws

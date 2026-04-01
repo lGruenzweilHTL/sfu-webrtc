@@ -1,7 +1,7 @@
 ﻿import asyncio
 import logging
 import uuid
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Callable, Any
 from aiortc import RTCPeerConnection, RTCSessionDescription, MediaStreamTrack
 from aiortc.contrib.media import MediaRelay
 
@@ -11,9 +11,9 @@ class SFUManager:
     def __init__(self):
         self.relay = MediaRelay()
         self.peer_connections: Dict[str, RTCPeerConnection] = {}
-        # List of {"audio": track, "video": track, "publisher_id": str}
         self.published_tracks: List[Dict] = []
         self.ice_candidates: Dict[str, List[dict]] = {}
+        self.subscribers: Dict[str, Dict[str, Any]] = {}
 
     def create_session_id(self) -> str:
         return str(uuid.uuid4())
@@ -47,6 +47,7 @@ class SFUManager:
                 pub_entry["audio"] = track
             elif track.kind == "video":
                 pub_entry["video"] = track
+            await self._notify_subscribers()
 
         @pc.on("icecandidate")
         async def on_ice(candidate):
@@ -74,18 +75,18 @@ class SFUManager:
             "type": pc.localDescription.type,
         }
 
-    async def add_subscriber(self, exclude_publisher: Optional[str] = None):
+    async def add_subscriber(self, notify_callback: Callable, exclude_publisher: Optional[str] = None):
         session_id = self.create_session_id()
         pc = RTCPeerConnection()
         self.peer_connections[session_id] = pc
         self.ice_candidates[session_id] = []
+        self.subscribers[session_id] = {
+            "callback": notify_callback,
+            "exclude": exclude_publisher,
+            "pc": pc
+        }
 
-        relay_tracks = self.get_published_relay_tracks(exclude_publisher=exclude_publisher)
-        for entry in relay_tracks:
-            if "audio" in entry:
-                pc.addTrack(entry["audio"])
-            if "video" in entry:
-                pc.addTrack(entry["video"])
+        await self._update_subscriber_tracks(session_id)
 
         @pc.on("icecandidate")
         async def on_ice(candidate):
@@ -111,6 +112,38 @@ class SFUManager:
             "type": pc.localDescription.type,
         }
 
+    async def _update_subscriber_tracks(self, session_id: str):
+        sub = self.subscribers.get(session_id)
+        if not sub:
+            return False
+        
+        pc = sub["pc"]
+        exclude = sub["exclude"]
+        relay_tracks = self.get_published_relay_tracks(exclude_publisher=exclude)
+        current_tracks = {sender.track for sender in pc.getSenders() if sender.track}
+        
+        added = False
+        for entry in relay_tracks:
+            if "audio" in entry and entry["audio"] not in current_tracks:
+                pc.addTrack(entry["audio"])
+                added = True
+            if "video" in entry and entry["video"] not in current_tracks:
+                pc.addTrack(entry["video"])
+                added = True
+        return added
+
+    async def _notify_subscribers(self):
+        for session_id, sub in list(self.subscribers.items()):
+            if await self._update_subscriber_tracks(session_id):
+                pc = sub["pc"]
+                offer = await pc.createOffer()
+                await pc.setLocalDescription(offer)
+                await sub["callback"]({
+                    "type": "offer",
+                    "sdp": pc.localDescription.sdp,
+                    "session_id": session_id
+                })
+
     async def set_answer(self, session_id: str, sdp: str, sdp_type: str):
         pc = self.peer_connections.get(session_id)
         if not pc:
@@ -125,6 +158,7 @@ class SFUManager:
             await pc.close()
         self.published_tracks = [p for p in self.published_tracks if p["publisher_id"] != session_id]
         self.ice_candidates.pop(session_id, None)
+        self.subscribers.pop(session_id, None)
         logger.info(f"[{session_id}] Cleaned up session")
 
     async def close_all(self):
@@ -133,3 +167,4 @@ class SFUManager:
         self.peer_connections.clear()
         self.published_tracks.clear()
         self.ice_candidates.clear()
+        self.subscribers.clear()

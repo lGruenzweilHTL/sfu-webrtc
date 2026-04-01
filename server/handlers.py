@@ -1,6 +1,8 @@
 ﻿import logging
-from aiohttp import web
+import json
+from aiohttp import web, WSMsgType
 from manager import SFUManager
+from aiortc import RTCIceCandidate
 
 logger = logging.getLogger("sfu-server")
 
@@ -12,20 +14,6 @@ class SFUHandlers:
         params = await request.json()
         result = await self.manager.add_publisher(params["sdp"], params["type"])
         return web.json_response(result)
-
-    async def handle_subscribe(self, request: web.Request) -> web.Response:
-        params = await request.json()
-        exclude = params.get("exclude_publisher")
-        result = await self.manager.add_subscriber(exclude_publisher=exclude)
-        return web.json_response(result)
-
-    async def handle_subscribe_answer(self, request: web.Request) -> web.Response:
-        params = await request.json()
-        session_id = params["session_id"]
-        ok = await self.manager.set_answer(session_id, params["sdp"], params["type"])
-        if not ok:
-            return web.json_response({"error": "session not found"}, status=404)
-        return web.json_response({"ok": True})
 
     async def handle_disconnect(self, request: web.Request) -> web.Response:
         params = await request.json()
@@ -45,29 +33,53 @@ class SFUHandlers:
             ]
         })
 
-    # Note: ICE candidates handling could be moved to manager if needed,
-    # but since it's state-heavy and the client's current use is simple polling,
-    # keeping it simple here for now or moving to manager if it gets complex.
-    async def handle_get_ice_candidates(self, request: web.Request) -> web.Response:
-        session_id = request.match_info["session_id"]
-        candidates = self.manager.ice_candidates.pop(session_id, [])
-        return web.json_response({"candidates": candidates})
+    async def handle_websocket(self, request: web.Request) -> web.WebSocketResponse:
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
 
-    async def handle_ice_candidate(self, request: web.Request) -> web.Response:
-        params = await request.json()
-        session_id = params["session_id"]
-        pc = self.manager.peer_connections.get(session_id)
-        if not pc:
-            return web.json_response({"error": "session not found"}, status=404)
+        session_id = None
 
-        from aiortc import RTCIceCandidate
-        candidate_data = params.get("candidate")
-        if candidate_data:
-            candidate = RTCIceCandidate(
-                component=1, foundation="0", ip=None, port=0, priority=0,
-                protocol="udp", type="host",
-                sdpMid=candidate_data.get("sdpMid"),
-                sdpMLineIndex=candidate_data.get("sdpMLineIndex"),
-            )
-            await pc.addIceCandidate(candidate)
-        return web.json_response({"ok": True})
+        async def notify_client(message: dict):
+            try:
+                await ws.send_json(message)
+            except Exception:
+                pass
+
+        try:
+            async for msg in ws:
+                if msg.type == WSMsgType.TEXT:
+                    data = json.loads(msg.data)
+                    msg_type = data.get("type")
+
+                    if not session_id:
+                        if msg_type == "subscribe":
+                            exclude = data.get("exclude_publisher")
+                            offer_data = await self.manager.add_subscriber(notify_client, exclude)
+                            session_id = offer_data["session_id"]
+                            await notify_client(offer_data)
+                            continue
+                        else:
+                            break
+
+                    if data.get("session_id") != session_id:
+                        continue
+
+                    if msg_type in ("answer", "answer_renegotiation"):
+                        await self.manager.set_answer(session_id, data["sdp"], data["type"])
+                    elif msg_type == "ice_candidate":
+                        pc = self.manager.peer_connections.get(session_id)
+                        cand = data.get("candidate")
+                        if pc and cand:
+                            candidate = RTCIceCandidate(
+                                component=1, foundation="0", ip=None, port=0, priority=0,
+                                protocol="udp", type="host",
+                                sdpMid=cand.get("sdpMid"),
+                                sdpMLineIndex=cand.get("sdpMLineIndex"),
+                            )
+                            await pc.addIceCandidate(candidate)
+                elif msg.type in (WSMsgType.CLOSE, WSMsgType.ERROR):
+                    break
+        finally:
+            if session_id:
+                await self.manager.cleanup(session_id)
+        return ws

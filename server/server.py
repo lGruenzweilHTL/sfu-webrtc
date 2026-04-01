@@ -41,10 +41,7 @@ def create_app() -> web.Application:
 
     routes = [
         app.router.add_post("/publish", handlers.handle_publish),
-        app.router.add_post("/subscribe", handlers.handle_subscribe),
-        app.router.add_post("/subscribe/answer", handlers.handle_subscribe_answer),
-        app.router.add_post("/ice-candidate", handlers.handle_ice_candidate),
-        app.router.add_get("/ice-candidates/{session_id}", handlers.handle_get_ice_candidates),
+        app.router.add_get("/ws", handlers.handle_websocket), # New WebSocket endpoint
         app.router.add_get("/publishers", handlers.handle_list_publishers),
         app.router.add_post("/disconnect", handlers.handle_disconnect),
     ]

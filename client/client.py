@@ -27,6 +27,7 @@ async def run_async(args, frame_store, local_frame_store, mute_state, stop_event
 
     pub_pc = sub_pc = None
     pub_sid = sub_sid = None
+    sub_ws = None
     preview = None
     all_sinks = []
 
@@ -48,7 +49,8 @@ async def run_async(args, frame_store, local_frame_store, mute_state, stop_event
                 await preview.start()
 
         if args.mode in ("subscribe", "both"):
-            sub_pc, sub_sid, vsinks, asinks = await do_subscribe(
+            # do_subscribe now returns the websocket as well
+            sub_pc, sub_sid, vsinks, asinks, sub_ws = await do_subscribe(
                 sfu, frame_store, exclude=pub_sid)
             all_sinks = vsinks + asinks
 
@@ -58,8 +60,8 @@ async def run_async(args, frame_store, local_frame_store, mute_state, stop_event
         try:
             loop.add_signal_handler(signal.SIGINT, stop_event.set)
             loop.add_signal_handler(signal.SIGTERM, stop_event.set)
-        except NotImplementedError:
-            # signal handlers not supported on Windows loop
+        except (NotImplementedError, ValueError):
+            # signal handlers not supported on Windows loop or if not in main thread
             pass
 
         while not stop_event.is_set():
@@ -72,8 +74,8 @@ async def run_async(args, frame_store, local_frame_store, mute_state, stop_event
             await s.stop()
         if pub_sid:
             await sfu.disconnect(pub_sid)
-        if sub_sid:
-            await sfu.disconnect(sub_sid)
+        if sub_ws:
+            await sub_ws.close()
         for pc in (pub_pc, sub_pc):
             if pc:
                 await pc.close()
