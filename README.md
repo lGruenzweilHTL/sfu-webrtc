@@ -62,8 +62,8 @@ python client/client.py --mode publish --video-source path/to/video.mp4
 ### 4. Run a subscriber client
 
 ```bash
-# Subscribe and save received video to a file
-python client/client.py --mode subscribe --output received.mp4
+# Subscribe to the room
+python client/client.py --mode subscribe
 
 # Or run as a full participant (publish + subscribe)
 python client/client.py --mode both --video-source test.mp4
@@ -81,7 +81,7 @@ python client/client.py --mode both --video-source test.mp4
 | `--video-source` | *(webcam)* | Use a video file instead of webcam |
 | `--no-video` | false | Publish audio only |
 | `--no-audio` | false | Publish video only |
-| `--output` | *(discard)* | Save received media to this file |
+| `--no-gui` | false | Disable the OpenCV GUI rendering |
 
 ## Server API
 
@@ -90,6 +90,7 @@ python client/client.py --mode both --video-source test.mp4
 | `/publish` | POST | Publisher sends SDP offer, receives answer |
 | `/subscribe` | POST | Server sends SDP offer to subscriber |
 | `/subscribe/answer` | POST | Subscriber sends SDP answer |
+| `/ws` | GET/WS | WebSocket for dynamic renegotiation and ICE |
 | `/publishers` | GET | List active publishers |
 | `/disconnect` | POST | Close a session |
 
@@ -102,8 +103,8 @@ See [docs/how-webrtc-works.md](docs/how-webrtc-works.md) for a full explanation 
 **Why an SFU and not P2P?**
 Each client only uploads once, regardless of how many others are watching. The server forwards packets without decoding — low CPU cost, good scalability.
 
-**Why HTTP signaling?**
-Simple and stateless. A real production system would use WebSocket for lower-latency trickle ICE, but HTTP polling works fine for a demonstration.
+**Why HTTP and WebSocket signaling?**
+HTTP is used for the initial SDP exchange because it's simple and stateless. WebSockets are then used for lower-latency trickle ICE and dynamic renegotiations when new publishers join.
 
 **Why aiortc?**
 It's a pure-Python, full-featured WebRTC stack. It handles ICE, DTLS, SRTP, and codec packetization. The `MediaRelay` class makes SFU forwarding trivial.
@@ -111,7 +112,5 @@ It's a pure-Python, full-featured WebRTC stack. It handles ICE, DTLS, SRTP, and 
 ## Extending This
 
 - **Add STUN/TURN** for clients behind NAT — pass `RTCConfiguration` with `iceServers` to `RTCPeerConnection`
-- **WebSocket signaling** — replace the HTTP polling with a WebSocket channel for true trickle ICE
-- **Browser client** — the server API is HTTP+JSON; a browser using the standard `RTCPeerConnection` API can connect with minimal changes
-- **Dynamic subscriptions** — re-negotiate subscriber connections when new publishers join
+- **Browser client** — the server API is HTTP+JSON/WS; a browser using the standard `RTCPeerConnection` API can connect with minimal changes
 - **Recording** — replace `MediaBlackhole` with `MediaRecorder` to save streams to disk

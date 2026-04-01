@@ -31,7 +31,7 @@ A WebRTC call involves three distinct problems that the spec solves separately:
 | How do they agree on what to send? | SDP + signaling |
 | How do they send it securely? | DTLS + SRTP |
 
-WebRTC intentionally does **not** define signaling — how peers exchange connection information is left to the application. This project uses plain HTTP POST requests, but WebSocket, SIP, XMPP, or carrier pigeons all work.
+WebRTC intentionally does **not** define signaling — how peers exchange connection information is left to the application. This project uses a mix of HTTP POST requests for the initial exchange and WebSockets for dynamic updates, but SIP, XMPP, or carrier pigeons all work.
 
 ---
 
@@ -283,6 +283,7 @@ C ──▶      ──▶ composed stream ──▶ C
 | `/publish` | POST | Publisher | Send SDP offer, receive SDP answer |
 | `/subscribe` | POST | Subscriber | Request subscription, receive SDP offer |
 | `/subscribe/answer` | POST | Subscriber | Send SDP answer back |
+| `/ws` | WS | Either | WebSocket for dynamic renegotiation and ICE |
 | `/ice-candidate` | POST | Either | Send trickle ICE candidate |
 | `/ice-candidates/{id}` | GET | Either | Poll for server's candidates |
 | `/publishers` | GET | Anyone | List active publishers |
@@ -365,7 +366,7 @@ pc = RTCPeerConnection(configuration=config)
 
 **aiortc's MediaPlayer loops.** When using a file as a source, `loop=True` keeps sending frames indefinitely — useful for testing. Remove it for one-shot playback.
 
-**Subscribers must connect after publishers.** The SFU adds tracks from currently active publishers at subscribe time. If a new publisher joins after a subscriber connected, the subscriber won't see the new publisher without re-subscribing. Production SFUs handle this with server-side re-negotiation.
+**Dynamic Renegotiation.** The SFU pushes new tracks to existing subscribers dynamically over WebSockets. Existing subscribers seamlessly receive new tracks from publishers joining later without having to disconnect and re-subscribe.
 
 ---
 
