@@ -2,6 +2,7 @@
 import json
 import logging
 from aiortc import RTCPeerConnection, RTCSessionDescription
+from aiortc.sdp import candidate_from_sdp
 from sinks import VideoSink, AudioSink
 from aiohttp import WSMsgType
 
@@ -20,6 +21,11 @@ async def do_publish(sfu, media, no_video=False, no_audio=False):
 
     offer = await pc.createOffer()
     await pc.setLocalDescription(offer)
+    
+    # Wait for local ICE candidates to finish gathering before sending the SDP
+    while pc.iceGatheringState != "complete":
+        await asyncio.sleep(0.1)
+
     resp = await sfu.publish(pc.localDescription.sdp)
     await pc.setRemoteDescription(RTCSessionDescription(sdp=resp["sdp"], type=resp["type"]))
     logger.info(f"Published — session {resp['session_id']}")
@@ -107,6 +113,16 @@ async def do_subscribe(sfu, video_queue, exclude=None):
                                 })
                         except Exception as e:
                             logger.error(f"Signaling error: {e}")
+                elif msg_type == "ice_candidate":
+                    cand = data.get("candidate")
+                    if pc and cand:
+                        try:
+                            candidate = candidate_from_sdp(cand["candidate"])
+                            candidate.sdpMid = cand.get("sdpMid")
+                            candidate.sdpMLineIndex = cand.get("sdpMLineIndex")
+                            await pc.addIceCandidate(candidate)
+                        except Exception as e:
+                            logger.error(f"Failed to add ICE candidate: {e}")
             elif msg.type in (WSMsgType.CLOSE, WSMsgType.ERROR):
                 break
 

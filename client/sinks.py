@@ -8,6 +8,7 @@ try:
     import sounddevice as sd
     AUDIO_AVAILABLE = True
 except (OSError, ImportError):
+    sd = None
     AUDIO_AVAILABLE = False
 
 logger = logging.getLogger("webrtc-client")
@@ -48,25 +49,23 @@ class VideoSink:
                     continue
                     
                 self._busy = True
-                try:
-                    # Offload the CPU-bound BGR conversion to the thread pool
-                    bgr_frame = await loop.run_in_executor(
-                        executor, partial(frame.to_ndarray, format="bgr24")
-                    )
-                    # Push directly to the multiprocessing queue for the GUI process
-                    # block=False + full exception handling drops frame if queue is congested
+                
+                def _process_video(f):
                     try:
+                        bgr_frame = f.to_ndarray(format="bgr24")
                         self._video_queue.put_nowait((self.label, bgr_frame))
                     except Exception:
                         pass
-                finally:
-                    self._busy = False
+                    finally:
+                        self._busy = False
+                        
+                # Run in background to keep the async loop free to recv() more frames
+                loop.run_in_executor(executor, _process_video, frame)
                     
             except Exception:
                 break
 
 class AudioSink:
-    SAMPLE_RATE = 48000
     CHANNELS = 1
 
     def __init__(self, label: str):
@@ -79,18 +78,9 @@ class AudioSink:
         self._track = track
 
     async def start(self):
-        if not AUDIO_AVAILABLE or not self._track:
+        if not self._track:
             return
-        try:
-            self._stream = sd.OutputStream(
-                samplerate=self.SAMPLE_RATE,
-                channels=self.CHANNELS,
-                dtype="float32",
-            )
-            self._stream.start()
-            self._task = asyncio.ensure_future(self._run())
-        except Exception:
-            pass
+        self._task = asyncio.ensure_future(self._run())
 
     async def stop(self):
         if self._task:
@@ -104,17 +94,74 @@ class AudioSink:
             self._stream.close()
 
     async def _run(self):
-        while True:
-            try:
+        if not AUDIO_AVAILABLE:
+            # Consume frames silently to prevent unhandled track JitterBuffer warnings
+            while True:
+                try:
+                    await self._track.recv()
+                except Exception:
+                    break
+            return
+            
+        import queue
+        import threading
+        
+        q = queue.Queue(maxsize=100)
+        
+        def _audio_thread():
+            while True:
+                item = q.get()
+                if item is None:
+                    break
+                    
+                mono, sample_rate = item
+                
+                if self._stream is None:
+                    try:
+                        import sounddevice as sdev
+                        self._stream = sdev.OutputStream(
+                            samplerate=sample_rate,
+                            channels=self.CHANNELS,
+                            dtype="float32",
+                        )
+                        self._stream.start()
+                    except Exception as e:
+                        logger.error(f"Failed to start audio stream: {e}")
+                        break
+
+                if self._stream and self._stream.active:
+                    try:
+                        self._stream.write(mono)
+                    except Exception:
+                        pass
+                        
+        t = threading.Thread(target=_audio_thread, daemon=True)
+        t.start()
+        
+        try:
+            while True:
                 frame = await self._track.recv()
                 audio = frame.to_ndarray()
                 mono = audio.mean(axis=0).astype(np.float32)
                 if frame.format.name != "fltp":
                     mono = mono / 32768.0
-                if self._stream and self._stream.active:
-                    self._stream.write(mono)
-            except Exception:
-                break
+                
+                try:
+                    q.put_nowait((mono, frame.sample_rate))
+                except queue.Full:
+                    # If queue is full, drop the oldest frame to make room for the newest.
+                    # This prevents memory leaks (by never blocking recv) and minimizes 
+                    # audio desync by skipping the oldest data instead of blocking.
+                    try:
+                        q.get_nowait()
+                        q.put_nowait((mono, frame.sample_rate))
+                    except (queue.Empty, queue.Full):
+                        pass
+        except Exception:
+            pass
+        finally:
+            q.put(None)
+            t.join(timeout=1.0)
 
 class LocalPreviewSink:
     def __init__(self, track, video_queue):
@@ -144,15 +191,16 @@ class LocalPreviewSink:
                     continue
                     
                 self._busy = True
-                try:
-                    bgr_frame = await loop.run_in_executor(
-                        executor, partial(frame.to_ndarray, format="bgr24")
-                    )
+                
+                def _process_local(f):
                     try:
+                        bgr_frame = f.to_ndarray(format="bgr24")
                         self._video_queue.put_nowait(("local", bgr_frame))
                     except Exception:
                         pass
-                finally:
-                    self._busy = False
+                    finally:
+                        self._busy = False
+                        
+                loop.run_in_executor(executor, _process_local, frame)
             except Exception:
                 break

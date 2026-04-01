@@ -55,11 +55,23 @@ class SFUManager:
         @pc.on("icecandidate")
         async def on_ice(candidate):
             if candidate:
-                self.ice_candidates[session_id].append({
+                cand_dict = {
                     "candidate": candidate.candidate,
                     "sdpMid": candidate.sdpMid,
                     "sdpMLineIndex": candidate.sdpMLineIndex,
-                })
+                }
+                self.ice_candidates[session_id].append(cand_dict)
+                # Send to subscriber via websocket if available
+                sub = self.subscribers.get(session_id)
+                if sub:
+                    try:
+                        await sub["callback"]({
+                            "type": "ice_candidate",
+                            "session_id": session_id,
+                            "candidate": cand_dict
+                        })
+                    except Exception:
+                        pass
 
         @pc.on("connectionstatechange")
         async def on_state():
@@ -69,6 +81,9 @@ class SFUManager:
         await pc.setRemoteDescription(RTCSessionDescription(sdp=sdp, type=sdp_type))
         answer = await pc.createAnswer()
         await pc.setLocalDescription(answer)
+
+        while pc.iceGatheringState != "complete":
+            await asyncio.sleep(0.1)
 
         return {
             "session_id": session_id,
@@ -94,11 +109,23 @@ class SFUManager:
         @pc.on("icecandidate")
         async def on_ice(candidate):
             if candidate:
-                self.ice_candidates[session_id].append({
+                cand_dict = {
                     "candidate": candidate.candidate,
                     "sdpMid": candidate.sdpMid,
                     "sdpMLineIndex": candidate.sdpMLineIndex,
-                })
+                }
+                self.ice_candidates[session_id].append(cand_dict)
+                # Send to subscriber via websocket if available
+                sub = self.subscribers.get(session_id)
+                if sub:
+                    try:
+                        await sub["callback"]({
+                            "type": "ice_candidate",
+                            "session_id": session_id,
+                            "candidate": cand_dict
+                        })
+                    except Exception:
+                        pass
 
         @pc.on("connectionstatechange")
         async def on_state():

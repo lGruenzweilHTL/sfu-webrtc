@@ -6,6 +6,7 @@ import threading
 import multiprocessing
 import aiohttp
 
+from aiortc.contrib.media import MediaRelay
 from signaling import SFUClient
 from media import open_camera_and_mic
 from sinks import LocalPreviewSink
@@ -14,6 +15,14 @@ from webrtc import do_publish, do_subscribe
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("webrtc-client")
+
+async def discard_track(track):
+    """Continuously consume frames from an ignored track to prevent memory bloat."""
+    try:
+        while True:
+            await track.recv()
+    except Exception:
+        pass
 
 async def run_async(args, video_queue, mute_state, stop_event):
     url = f"http://{args.host}:{args.port}"
@@ -27,6 +36,7 @@ async def run_async(args, video_queue, mute_state, stop_event):
 
     async with aiohttp.ClientSession() as http:
         sfu = SFUClient(url, http)
+        media = None
 
         if args.mode in ("publish", "both"):
             try:
@@ -36,10 +46,36 @@ async def run_async(args, video_queue, mute_state, stop_event):
                 stop_event.set()
                 return
 
-            pub_pc, pub_sid = await do_publish(sfu, media, args.no_video, args.no_audio)
+            relay = MediaRelay()
+            video_track = None
+            audio_track = None
 
-            if media.video and not args.no_video and not args.no_gui:
-                preview = LocalPreviewSink(media.video, video_queue)
+            # Only subscribe to the relay if we actually need the track.
+            # If we don't need it (e.g. --no-video), we MUST explicitly consume the base
+            # track via discard_track, otherwise MediaPlayer pushes to an infinite queue in RAM.
+            if media.video:
+                if args.no_video:
+                    asyncio.ensure_future(discard_track(media.video))
+                else:
+                    video_track = relay.subscribe(media.video)
+                    
+            if media.audio:
+                if args.no_audio:
+                    asyncio.ensure_future(discard_track(media.audio))
+                else:
+                    audio_track = relay.subscribe(media.audio)
+
+            # Create a mock media object to pass to do_publish
+            class _MockMedia:
+                def __init__(self, v, a):
+                    self.video = v
+                    self.audio = a
+            
+            pub_pc, pub_sid = await do_publish(sfu, _MockMedia(video_track, audio_track), args.no_video, args.no_audio)
+
+            if video_track and media.video and not args.no_gui:
+                preview_track = relay.subscribe(media.video)
+                preview = LocalPreviewSink(preview_track, video_queue)
                 await preview.start()
 
         if args.mode in ("subscribe", "both"):
@@ -71,6 +107,11 @@ async def run_async(args, video_queue, mute_state, stop_event):
         for pc in (pub_pc, sub_pc):
             if pc:
                 await pc.close()
+        if media:
+            if media.video:
+                media.video.stop()
+            if media.audio:
+                media.audio.stop()
 
 def main():
     parser = argparse.ArgumentParser(description="WebRTC SFU client")

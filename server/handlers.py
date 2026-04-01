@@ -3,6 +3,7 @@ import json
 from aiohttp import web, WSMsgType
 from manager import SFUManager
 from aiortc import RTCIceCandidate
+from aiortc.sdp import candidate_from_sdp
 
 logger = logging.getLogger("sfu-server")
 
@@ -70,13 +71,13 @@ class SFUHandlers:
                         pc = self.manager.peer_connections.get(session_id)
                         cand = data.get("candidate")
                         if pc and cand:
-                            candidate = RTCIceCandidate(
-                                component=1, foundation="0", ip=None, port=0, priority=0,
-                                protocol="udp", type="host",
-                                sdpMid=cand.get("sdpMid"),
-                                sdpMLineIndex=cand.get("sdpMLineIndex"),
-                            )
-                            await pc.addIceCandidate(candidate)
+                            try:
+                                candidate = candidate_from_sdp(cand["candidate"])
+                                candidate.sdpMid = cand.get("sdpMid")
+                                candidate.sdpMLineIndex = cand.get("sdpMLineIndex")
+                                await pc.addIceCandidate(candidate)
+                            except Exception as e:
+                                logger.error(f"Failed to add ICE candidate: {e}")
                 elif msg.type in (WSMsgType.CLOSE, WSMsgType.ERROR):
                     break
         finally:
