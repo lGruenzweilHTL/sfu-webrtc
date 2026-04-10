@@ -24,7 +24,15 @@ webrtc-project/
 
 ## Quick Start
 
-### 1. Install dependencies
+### 1. Set up virtual environment
+
+```bash
+python -m venv .venv
+source .venv/bin/activate # Linux
+.venv\Scripts\activate # Windows
+```
+
+### 2. Install dependencies
 
 ```bash
 pip install -r requirements.txt
@@ -42,14 +50,14 @@ brew install ffmpeg
 # Download from https://ffmpeg.org/download.html
 ```
 
-### 2. Start the server
+### 3. Start the server
 
 ```bash
 python server/server.py
 # Listening on http://0.0.0.0:8080
 ```
 
-### 3. Run a publisher client
+### 4. Run a publisher client
 
 ```bash
 # Using your webcam (Linux)
@@ -59,7 +67,7 @@ python client/client.py --mode publish
 python client/client.py --mode publish --video-source path/to/video.mp4
 ```
 
-### 4. Run a subscriber client
+### 5. Run a subscriber client
 
 ```bash
 # Subscribe to the room
